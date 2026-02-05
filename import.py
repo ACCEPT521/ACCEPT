@@ -6,7 +6,6 @@ import pandas as pd
 import scipy.sparse as sp
 import joblib
 import streamlit as st
-import shap
 import matplotlib.pyplot as plt
 
 # -----------------------------
@@ -29,9 +28,10 @@ def load_deploy_resources(path: Path):
     return res
 
 
-def render_force_plot(exp: shap.Explanation):
+def render_force_plot(exp):
     plt.figure(figsize=(8, 4))
-    # waterfall 更适合医学解释；且不依赖 JS，部署最稳
+    # shap 在 do_shap 内部导入，这里直接使用 exp
+    import shap
     shap.plots.waterfall(exp, max_display=9, show=False)
     st.pyplot(plt.gcf(), clear_figure=True)
 
@@ -138,8 +138,9 @@ x = pd.DataFrame(
 )
 
 # 与训练一致：PG/reactions 用 str 进入 OneHot
-x["PG"] = x["PG"].astype(int).astype(str)
-x["reactions"] = x["reactions"].astype(int).astype(str)
+# ✅ 稳定：不要再 astype(int)，避免 '0.0' 导致崩
+x["PG"] = x["PG"].astype(str).str.replace(r"\.0$", "", regex=True)
+x["reactions"] = x["reactions"].astype(str).str.replace(r"\.0$", "", regex=True)
 
 st.divider()
 
@@ -171,77 +172,65 @@ if predict_btn:
         st.markdown(" SHAP 个体解释")
 
         try:
-            # ================
-            # ✅ 关键修改：解释整个 best_model（pipeline），而不是 clf 的预处理后空间
-            # ================
+            # ✅ 关键：只有在点 SHAP 时才导入，避免启动阶段崩溃
+            import shap
 
-            # ✅ 生产防崩：只缓存处理后的 background（小数组/DataFrame），不缓存 explainer 对象
             @st.cache_data
             def get_bg_raw(_background, _x_df, _top_vars):
                 top_vars = list(_top_vars)
 
-                # 1) background 本身就是 DataFrame（且含 Top9 列） -> 直接用
                 if isinstance(_background, pd.DataFrame):
                     cols_ok = all(v in _background.columns for v in top_vars)
                     if cols_ok:
                         bg_df = _background[top_vars].copy()
-                        # 与训练一致：PG/reactions 用 str
                         if "PG" in bg_df.columns:
-                            bg_df["PG"] = bg_df["PG"].astype(int).astype(str)
+                            bg_df["PG"] = bg_df["PG"].astype(str).str.replace(r"\.0$", "", regex=True)
                         if "reactions" in bg_df.columns:
-                            bg_df["reactions"] = bg_df["reactions"].astype(int).astype(str)
-                        # 防止太大
+                            bg_df["reactions"] = bg_df["reactions"].astype(str).str.replace(r"\.0$", "", regex=True)
                         if bg_df.shape[0] > 80:
                             bg_df = bg_df.iloc[:80, :].copy()
                         return bg_df
 
-                # 2) background 是 ndarray 且列数刚好等于 Top9 -> 当作原始输入空间（编码值）用
                 try:
                     bg_arr = np.asarray(_background)
                     if bg_arr.ndim == 2 and bg_arr.shape[1] == len(top_vars):
                         bg_df = pd.DataFrame(bg_arr, columns=top_vars)
                         if "PG" in bg_df.columns:
-                            bg_df["PG"] = bg_df["PG"].astype(int).astype(str)
+                            bg_df["PG"] = bg_df["PG"].astype(str).str.replace(r"\.0$", "", regex=True)
                         if "reactions" in bg_df.columns:
-                            bg_df["reactions"] = bg_df["reactions"].astype(int).astype(str)
+                            bg_df["reactions"] = bg_df["reactions"].astype(str).str.replace(r"\.0$", "", regex=True)
                         if bg_df.shape[0] > 80:
                             bg_df = bg_df.iloc[:80, :].copy()
                         return bg_df
                 except Exception:
                     pass
 
-                # 3) 降级兜底：保存的 background 是预处理后空间（高维）无法还原 -> 用当前 x 复制背景
-                #    这样一定不崩，但解释精度会弱一些（展示一定是原始变量名=值）
                 bg_df = pd.concat([_x_df.copy()] * 30, ignore_index=True)
                 return bg_df
 
             bg_raw_df = get_bg_raw(background, x, TOP9_VARS)
 
-            # ✅ 防崩：最终必须是 Top9 列
             if not isinstance(bg_raw_df, pd.DataFrame) or bg_raw_df.shape[1] != len(TOP9_VARS):
                 raise ValueError(
                     f"raw background 构造失败，得到形状={getattr(bg_raw_df, 'shape', None)}，"
                     f"但期望列数={len(TOP9_VARS)}。"
                 )
 
-            # ✅ 防崩：nsamples 默认降档；需要更精细可再调高
-            fast_mode = st.checkbox("SHAP ", value=True)
-            nsamples = 100 if fast_mode else 300
+            fast_mode = st.checkbox("SHAP（快速）", value=True)
+            nsamples = 80 if fast_mode else 150  # ✅ 再保守一点更稳
 
-            # f 接收 numpy array（原始输入空间），内部转成 DataFrame 再走 best_model
             def f_raw(X_array):
                 X_df = pd.DataFrame(X_array, columns=TOP9_VARS)
-
-                # 与训练一致：PG/reactions 用 str 进入 OneHot
                 if "PG" in X_df.columns:
-                    X_df["PG"] = X_df["PG"].astype(int).astype(str)
+                    X_df["PG"] = X_df["PG"].astype(str).str.replace(r"\.0$", "", regex=True)
                 if "reactions" in X_df.columns:
-                    X_df["reactions"] = X_df["reactions"].astype(int).astype(str)
-
+                    X_df["reactions"] = X_df["reactions"].astype(str).str.replace(r"\.0$", "", regex=True)
                 return best_model.predict_proba(X_df)[:, 1]
 
             with st.spinner("正在计算（可能需要几秒到几十秒）..."):
-                explainer = shap.KernelExplainer(f_raw, bg_raw_df.values)
+                # ✅ 背景再截断一次，降低云端压力
+                bg_use = bg_raw_df.iloc[:30, :].copy()
+                explainer = shap.KernelExplainer(f_raw, bg_use.values)
                 shap_values = explainer.shap_values(x.values, nsamples=nsamples)
 
             shap_pos = shap_values[0] if isinstance(shap_values, list) else shap_values
@@ -249,7 +238,6 @@ if predict_btn:
             ev = explainer.expected_value
             ev = ev[0] if isinstance(ev, (list, np.ndarray)) else ev
 
-            # ✅ 这里用原始空间：feature_names=TOP9_VARS，data 用 x 的原始输入值
             exp = shap.Explanation(
                 values=shap_pos[0],
                 base_values=ev,
@@ -258,7 +246,6 @@ if predict_btn:
             )
             render_force_plot(exp)
 
-            # （可选）你要是想在页面里也明确展示“原始变量=值”，可以展开表看
             with st.expander("查看 SHAP 使用的原始输入（用于对照）"):
                 st.dataframe(x)
 
@@ -266,3 +253,4 @@ if predict_btn:
             st.warning(f"SHAP 解释生成失败（不影响预测结果）：{e}")
 
 st.caption("运行:pip install -r requirements.txt  |  streamlit run app.py")
+
